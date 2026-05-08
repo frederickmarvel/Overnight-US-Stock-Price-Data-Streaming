@@ -61,6 +61,30 @@ python ibkr_tws_stream.py --readonly --symbol AAPL --exchange OVERNIGHT --primar
 
 IBKR notes that Overnight market data should use the same `OVERNIGHT` routing as Overnight orders because it may differ from regular `SMART` market data.
 
+Stream a direct venue such as IEX or BATS:
+
+```bash
+python ibkr_tws_stream.py --readonly --symbol AAPL --venue iex
+python ibkr_tws_stream.py --readonly --symbol AAPL --venue bats
+```
+
+You can also use the raw IBKR exchange code directly:
+
+```bash
+python ibkr_tws_stream.py --readonly --symbol AAPL --exchange IEX
+python ibkr_tws_stream.py --readonly --symbol AAPL --exchange BATS
+```
+
+For your live TWS session, direct AAPL venue contracts qualify when `primaryExchange` is omitted. If you add `--primary-exchange NASDAQ` to direct `IEX` or `BATS`, TWS may reject the contract as an invalid destination.
+
+Stream a Korean stock on KRX, for example Samsung Electronics:
+
+```bash
+python ibkr_tws_stream.py --readonly --symbol 005930 --venue krx --currency KRW
+```
+
+Your live TWS resolved Samsung Electronics as `005930` on `KRX`, local symbol `005930.KS`. `KSE` did not resolve through this API session.
+
 ## Guarded Order Examples
 
 The script will not place an order unless you pass both acknowledgement flags:

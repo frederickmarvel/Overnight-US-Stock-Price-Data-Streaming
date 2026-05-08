@@ -146,6 +146,42 @@ The CSV will include:
 - Ask size
 - Last size
 
+## Stream Direct Venues: BATS and IEX
+
+The script supports direct venue selection using `--venue`.
+
+IEX:
+
+```bash
+python ibkr_tws_stream.py --readonly --symbol AAPL --venue iex
+```
+
+BATS:
+
+```bash
+python ibkr_tws_stream.py --readonly --symbol AAPL --venue bats
+```
+
+The same requests can be written with raw IBKR exchange codes:
+
+```bash
+python ibkr_tws_stream.py --readonly --symbol AAPL --exchange IEX
+python ibkr_tws_stream.py --readonly --symbol AAPL --exchange BATS
+```
+
+Important:
+
+- Direct venue market data depends on the exchange feed and account permissions.
+- `SMART` gives IBKR's smart-routed view, while `IEX` and `BATS` ask for that venue directly.
+- Your live TWS contract-detail test accepted direct `IEX` and `BATS` for AAPL only when `primaryExchange` was omitted.
+- If IBKR returns a market-data subscription error, the TCP connection still works; the missing piece is the market-data entitlement for that requested venue/feed.
+
+Test result on live TWS:
+
+- `--venue iex` connected and qualified AAPL as `exchange='IEX'`, then returned IBKR error `10089`.
+- `--venue bats` connected and qualified AAPL as `exchange='BATS'`, then returned IBKR error `10089`.
+- This confirms the code path and direct venue contract are working; the remaining blocker is market-data permission/subscription for the requested top-of-book feed.
+
 ## Delayed Market Data
 
 If realtime entitlement is unavailable, try delayed market data:
@@ -161,6 +197,35 @@ Requested market data requires additional subscription for API
 ```
 
 That means the TWS socket is working, but the account/session needs the relevant market-data subscription for the requested feed.
+
+## Stream Korean Stocks On KRX
+
+Your live TWS session resolved Samsung Electronics with:
+
+- Symbol: `005930`
+- Exchange: `KRX`
+- Currency: `KRW`
+- Local symbol: `005930.KS`
+- conId: `17382528`
+
+Use:
+
+```bash
+python ibkr_tws_stream.py --readonly --symbol 005930 --venue krx --currency KRW
+```
+
+Or with the raw exchange code:
+
+```bash
+python ibkr_tws_stream.py --readonly --symbol 005930 --exchange KRX --currency KRW
+```
+
+Test result on live TWS:
+
+- `005930` on `KRX` qualified successfully.
+- A 20-second live stream produced quote callbacks.
+- Values were unavailable at test time because the market/data session was not active: bid/ask returned `-1.0` with size `0.0`.
+- `KSE` and `SMART` did not resolve Korean equities in this TWS session.
 
 ## Overnight Streaming
 
@@ -300,4 +365,3 @@ For long-running production-style deployment, prefer IB Gateway over full TWS be
 - `README.md`: quick start guide.
 - `memory.md`: implementation memory and tested state.
 - `Preparation.md`: this deployment and streaming runbook.
-

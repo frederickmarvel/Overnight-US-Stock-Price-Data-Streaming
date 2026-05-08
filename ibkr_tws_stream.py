@@ -26,6 +26,18 @@ MARKET_DATA_TYPES = {
     "delayed-frozen": 4,
 }
 
+VENUE_EXCHANGES = {
+    "smart": "SMART",
+    "iex": "IEX",
+    "bats": "BATS",
+    "byx": "BYX",
+    "edgx": "EDGX",
+    "edgea": "EDGEA",
+    "bex": "BEX",
+    "krx": "KRX",
+    "overnight": "OVERNIGHT",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -41,7 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbol", default="AAPL", help="Symbol to stream or trade.")
     parser.add_argument("--currency", default="USD", help="Contract currency.")
     parser.add_argument("--exchange", default="SMART", help="Exchange/routing for market data, e.g. SMART or OVERNIGHT.")
-    parser.add_argument("--primary-exchange", default="NASDAQ", help="Primary listing exchange, e.g. NASDAQ, NYSE.")
+    parser.add_argument(
+        "--venue",
+        choices=VENUE_EXCHANGES,
+        help="Convenience alias for --exchange. Supported: smart, iex, bats, byx, edgx, edgea, bex, krx, overnight.",
+    )
+    parser.add_argument("--primary-exchange", default="", help="Primary listing exchange, e.g. NASDAQ, NYSE.")
     parser.add_argument(
         "--market-data-type",
         choices=MARKET_DATA_TYPES,
@@ -69,6 +86,12 @@ def parse_args() -> argparse.Namespace:
         help="Second required acknowledgement before any order can be submitted.",
     )
     return parser.parse_args()
+
+
+def selected_exchange(args: argparse.Namespace) -> str:
+    if args.venue:
+        return VENUE_EXCHANGES[args.venue]
+    return args.exchange
 
 
 def build_stock(symbol: str, exchange: str, currency: str, primary_exchange: str) -> Stock:
@@ -169,7 +192,7 @@ def place_limit_order(ib: IB, args: argparse.Namespace) -> None:
 
 
 def stream_market_data(ib: IB, args: argparse.Namespace) -> None:
-    contract = build_stock(args.symbol, args.exchange, args.currency, args.primary_exchange)
+    contract = build_stock(args.symbol, selected_exchange(args), args.currency, args.primary_exchange)
     ib.qualifyContracts(contract)
     ib.reqMarketDataType(MARKET_DATA_TYPES[args.market_data_type])
     ticker = ib.reqMktData(contract, genericTickList=args.generic_ticks, snapshot=False, regulatorySnapshot=False)
