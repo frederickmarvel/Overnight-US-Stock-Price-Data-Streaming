@@ -1,6 +1,6 @@
 # IBKR TWS Streaming Starter
 
-This repo contains a small Python starter for connecting to Interactive Brokers Trader Workstation (TWS) or IB Gateway over the local TCP socket, streaming realtime market data, and optionally testing guarded limit-order submission.
+This repo contains a small Python starter for connecting to Interactive Brokers Trader Workstation (TWS) or IB Gateway over the local TCP socket, streaming realtime market data, and optionally testing guarded limit-order submission. A Go alternative is also available at `cmd/ibkr-tws-stream-go`.
 
 ## What IBKR Must Be Running
 
@@ -24,6 +24,62 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+## Go Alternative
+
+The Go implementation mirrors the Python CLI and uses the native TWS socket API through `github.com/hadrianl/ibapi`.
+
+Run tests:
+
+```bash
+go test ./...
+```
+
+Build the Go command:
+
+```bash
+go build ./cmd/ibkr-tws-stream-go
+```
+
+Test the live TWS connection:
+
+```bash
+go run ./cmd/ibkr-tws-stream-go --readonly --connection-test
+```
+
+Stream realtime data:
+
+```bash
+go run ./cmd/ibkr-tws-stream-go --readonly --symbol AAPL --primary-exchange NASDAQ
+```
+
+Stream delayed data:
+
+```bash
+go run ./cmd/ibkr-tws-stream-go --readonly --symbol AAPL --market-data-type delayed
+```
+
+Save ticks to CSV:
+
+```bash
+go run ./cmd/ibkr-tws-stream-go --readonly --symbol AAPL --csv data/aapl_ticks.csv
+```
+
+Guarded outside-regular-hours limit order:
+
+```bash
+go run ./cmd/ibkr-tws-stream-go \
+  --symbol AAPL \
+  --primary-exchange NASDAQ \
+  --place-limit BUY \
+  --quantity 1 \
+  --limit-price 100.00 \
+  --route outside-rth \
+  --allow-trading \
+  --i-understand-live-trading
+```
+
+Note: the Python `ib-insync` client exposes a per-connection read-only option. The Go API wrapper used here does not expose the same option, so the Go command treats `--readonly` as a program-level order block. Keep TWS/Gateway `Read-Only API` enabled when you want server-side read-only enforcement.
 
 ## Test The Live TWS Connection
 
