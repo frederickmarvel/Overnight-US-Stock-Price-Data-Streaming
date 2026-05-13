@@ -48,6 +48,7 @@ type config struct {
 	timeout               time.Duration
 	connectionTest        bool
 	symbol                string
+	symbols               string
 	currency              string
 	exchange              string
 	venue                 string
@@ -56,6 +57,7 @@ type config struct {
 	genericTicks          string
 	csvPath               string
 	duration              time.Duration
+	subscribeInterval     time.Duration
 	placeLimit            string
 	quantity              float64
 	limitPrice            float64
@@ -75,14 +77,31 @@ type tickerState struct {
 	lastSize int64
 }
 
+type streamSubscription struct {
+	contract       ibapi.Contract
+	ticker         tickerState
+	requestedAt    time.Time
+	firstTickAt    time.Time
+	priceCallbacks int64
+	sizeCallbacks  int64
+	updates        int64
+}
+
+type ibErrorEvent struct {
+	reqID   int64
+	code    int64
+	message string
+	at      time.Time
+}
+
 type appWrapper struct {
 	ibapi.Wrapper
 
 	mu          sync.Mutex
 	accounts    []string
 	nextOrderID int64
-	ticker      tickerState
-	contract    *ibapi.Contract
+	streams     map[int64]*streamSubscription
+	errors      []ibErrorEvent
 	writer      *csv.Writer
 	csvFile     *os.File
 }
@@ -143,12 +162,14 @@ func parseArgs(args []string) (config, error) {
 
 	timeout := fs.Float64("timeout", 10, "Connection timeout in seconds.")
 	duration := fs.Float64("duration", 0, "Seconds to stream. 0 means run until Ctrl-C.")
+	subscribeIntervalMS := fs.Int("subscribe-interval-ms", 25, "Milliseconds to wait between market-data subscriptions.")
 	fs.StringVar(&cfg.host, "host", "127.0.0.1", "TWS/Gateway host. Keep local unless you know why.")
 	fs.IntVar(&cfg.port, "port", 7496, "Live TWS default: 7496. Paper TWS default: 7497.")
 	fs.Int64Var(&cfg.clientID, "client-id", 11, "Unique client ID for this program.")
 	fs.BoolVar(&cfg.readonly, "readonly", false, "Refuse order placement from this program.")
 	fs.BoolVar(&cfg.connectionTest, "connection-test", false, "Connect, print account/session info, then exit.")
 	fs.StringVar(&cfg.symbol, "symbol", "AAPL", "Symbol to stream or trade.")
+	fs.StringVar(&cfg.symbols, "symbols", "", "Comma-separated symbols to stream in one API session. For orders, use --symbol.")
 	fs.StringVar(&cfg.currency, "currency", "USD", "Contract currency.")
 	fs.StringVar(&cfg.exchange, "exchange", "SMART", "Exchange/routing for market data, e.g. SMART or OVERNIGHT.")
 	fs.StringVar(&cfg.venue, "venue", "", "Convenience alias for --exchange.")
@@ -174,6 +195,7 @@ func parseArgs(args []string) (config, error) {
 	}
 	cfg.timeout = secondsDuration(*timeout)
 	cfg.duration = secondsDuration(*duration)
+	cfg.subscribeInterval = time.Duration(*subscribeIntervalMS) * time.Millisecond
 	cfg.limitPriceSet = !math.IsNaN(cfg.limitPrice)
 	cfg.normalize()
 	return cfg, nil
@@ -198,8 +220,19 @@ func (cfg config) validate() error {
 	if cfg.route != "smart" && cfg.route != "outside-rth" && cfg.route != "overnight" && cfg.route != "overnight-day" {
 		return errors.New("--route must be one of: smart, outside-rth, overnight, overnight-day")
 	}
+	if cfg.subscribeInterval < 0 {
+		return errors.New("--subscribe-interval-ms must be >= 0")
+	}
+	if cfg.symbols != "" {
+		if _, err := parseSymbols(cfg.symbols); err != nil {
+			return err
+		}
+	}
 	if cfg.placeLimit == "" {
 		return nil
+	}
+	if cfg.symbols != "" {
+		return errors.New("--symbols is only supported for streaming; use --symbol for orders")
 	}
 	if cfg.placeLimit != "BUY" && cfg.placeLimit != "SELL" {
 		return errors.New("--place-limit must be BUY or SELL")
@@ -217,7 +250,16 @@ func (cfg config) validate() error {
 }
 
 func streamMarketData(client *ibapi.IbClient, wrapper *appWrapper, cfg config) error {
-	contract := buildStock(cfg.symbol, selectedExchange(cfg), cfg.currency, cfg.primaryExchange)
+	symbols, err := streamSymbols(cfg)
+	if err != nil {
+		_ = client.Disconnect()
+		return err
+	}
+	contracts := make([]ibapi.Contract, 0, len(symbols))
+	for _, symbol := range symbols {
+		contracts = append(contracts, buildStock(symbol, selectedExchange(cfg), cfg.currency, cfg.primaryExchange))
+	}
+
 	csvFile, csvWriter, err := openCSV(cfg.csvPath)
 	if err != nil {
 		_ = client.Disconnect()
@@ -227,16 +269,24 @@ func streamMarketData(client *ibapi.IbClient, wrapper *appWrapper, cfg config) e
 		defer csvFile.Close()
 	}
 
-	wrapper.setStream(&contract, csvFile, csvWriter)
+	wrapper.setStreamOutput(csvFile, csvWriter)
 	if err := client.Run(); err != nil {
 		_ = client.Disconnect()
 		return err
 	}
 
-	reqID := client.GetReqID()
 	client.ReqMarketDataType(marketDataTypes[strings.ToLower(cfg.marketDataType)])
-	client.ReqMktData(reqID, &contract, cfg.genericTicks, false, false, nil)
-	fmt.Printf("Streaming %s@%s via %s:%d marketDataType=%s. Press Ctrl-C to stop.\n", contract.Symbol, contract.Exchange, cfg.host, cfg.port, cfg.marketDataType)
+	reqIDs := make([]int64, 0, len(contracts))
+	for i := range contracts {
+		reqID := client.GetReqID()
+		reqIDs = append(reqIDs, reqID)
+		wrapper.addStream(reqID, contracts[i], time.Now())
+		client.ReqMktData(reqID, &contracts[i], cfg.genericTicks, false, false, nil)
+		if cfg.subscribeInterval > 0 && i < len(contracts)-1 {
+			time.Sleep(cfg.subscribeInterval)
+		}
+	}
+	fmt.Printf("Streaming %s via %s:%d marketDataType=%s. Press Ctrl-C to stop.\n", streamLabel(contracts), cfg.host, cfg.port, cfg.marketDataType)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -253,8 +303,11 @@ func streamMarketData(client *ibapi.IbClient, wrapper *appWrapper, cfg config) e
 		fmt.Println("\nStopping stream.")
 	}
 
-	client.CancelMktData(reqID)
+	for _, reqID := range reqIDs {
+		client.CancelMktData(reqID)
+	}
 	time.Sleep(200 * time.Millisecond)
+	wrapper.printStreamSummary()
 	return client.Disconnect()
 }
 
@@ -309,6 +362,41 @@ func selectedExchange(cfg config) string {
 	return cfg.exchange
 }
 
+func streamSymbols(cfg config) ([]string, error) {
+	if cfg.symbols != "" {
+		return parseSymbols(cfg.symbols)
+	}
+	return parseSymbols(cfg.symbol)
+}
+
+func parseSymbols(raw string) ([]string, error) {
+	var symbols []string
+	seen := make(map[string]bool)
+	for _, item := range strings.Split(raw, ",") {
+		symbol := strings.TrimSpace(item)
+		if symbol == "" {
+			continue
+		}
+		if seen[symbol] {
+			continue
+		}
+		seen[symbol] = true
+		symbols = append(symbols, symbol)
+	}
+	if len(symbols) == 0 {
+		return nil, errors.New("at least one symbol is required")
+	}
+	return symbols, nil
+}
+
+func streamLabel(contracts []ibapi.Contract) string {
+	labels := make([]string, 0, len(contracts))
+	for _, contract := range contracts {
+		labels = append(labels, fmt.Sprintf("%s@%s", contract.Symbol, contract.Exchange))
+	}
+	return strings.Join(labels, ", ")
+}
+
 func openCSV(path string) (*os.File, *csv.Writer, error) {
 	if path == "" {
 		return nil, nil, nil
@@ -335,16 +423,28 @@ func openCSV(path string) (*os.File, *csv.Writer, error) {
 	return file, writer, writer.Error()
 }
 
-func (w *appWrapper) setStream(contract *ibapi.Contract, file *os.File, writer *csv.Writer) {
+func (w *appWrapper) setStreamOutput(file *os.File, writer *csv.Writer) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.contract = contract
 	w.csvFile = file
 	w.writer = writer
-	w.ticker = tickerState{
-		bid:  math.NaN(),
-		ask:  math.NaN(),
-		last: math.NaN(),
+	w.streams = make(map[int64]*streamSubscription)
+}
+
+func (w *appWrapper) addStream(reqID int64, contract ibapi.Contract, requestedAt time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.streams == nil {
+		w.streams = make(map[int64]*streamSubscription)
+	}
+	w.streams[reqID] = &streamSubscription{
+		contract:    contract,
+		requestedAt: requestedAt,
+		ticker: tickerState{
+			bid:  math.NaN(),
+			ask:  math.NaN(),
+			last: math.NaN(),
+		},
 	}
 }
 
@@ -372,34 +472,52 @@ func (w *appWrapper) TickPrice(reqID int64, tickType int64, price float64, attri
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	stream, ok := w.streams[reqID]
+	if !ok {
+		return
+	}
 	switch tickType {
 	case ibapi.BID, ibapi.DELAYED_BID:
-		w.ticker.bid = price
+		stream.ticker.bid = price
 	case ibapi.ASK, ibapi.DELAYED_ASK:
-		w.ticker.ask = price
+		stream.ticker.ask = price
 	case ibapi.LAST, ibapi.DELAYED_LAST:
-		w.ticker.last = price
+		stream.ticker.last = price
 	default:
 		return
 	}
-	w.printTickerLocked()
+	stream.priceCallbacks++
+	stream.updates++
+	if stream.firstTickAt.IsZero() {
+		stream.firstTickAt = time.Now()
+	}
+	w.printTickerLocked(stream)
 }
 
 func (w *appWrapper) TickSize(reqID int64, tickType int64, size int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	stream, ok := w.streams[reqID]
+	if !ok {
+		return
+	}
 	switch tickType {
 	case ibapi.BID_SIZE, ibapi.DELAYED_BID_SIZE:
-		w.ticker.bidSize = size
+		stream.ticker.bidSize = size
 	case ibapi.ASK_SIZE, ibapi.DELAYED_ASK_SIZE:
-		w.ticker.askSize = size
+		stream.ticker.askSize = size
 	case ibapi.LAST_SIZE, ibapi.DELAYED_LAST_SIZE:
-		w.ticker.lastSize = size
+		stream.ticker.lastSize = size
 	default:
 		return
 	}
-	w.printTickerLocked()
+	stream.sizeCallbacks++
+	stream.updates++
+	if stream.firstTickAt.IsZero() {
+		stream.firstTickAt = time.Now()
+	}
+	w.printTickerLocked(stream)
 }
 
 func (w *appWrapper) OrderStatus(orderID int64, status string, filled float64, remaining float64, avgFillPrice float64, permID int64, parentID int64, lastFillPrice float64, clientID int64, whyHeld string, mktCapPrice float64) {
@@ -411,8 +529,20 @@ func (w *appWrapper) Error(reqID int64, errCode int64, errString string) {
 	case 2104, 2106, 2158, 300:
 		fmt.Fprintf(os.Stderr, "IBKR notice reqID=%d code=%d: %s\n", reqID, errCode, errString)
 	default:
+		w.recordError(reqID, errCode, errString)
 		fmt.Fprintf(os.Stderr, "IBKR error reqID=%d code=%d: %s\n", reqID, errCode, errString)
 	}
+}
+
+func (w *appWrapper) recordError(reqID int64, code int64, message string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.errors = append(w.errors, ibErrorEvent{
+		reqID:   reqID,
+		code:    code,
+		message: message,
+		at:      time.Now(),
+	})
 }
 
 func (w *appWrapper) accountsSnapshot() []string {
@@ -421,21 +551,58 @@ func (w *appWrapper) accountsSnapshot() []string {
 	return append([]string(nil), w.accounts...)
 }
 
-func (w *appWrapper) printTickerLocked() {
-	if w.contract == nil {
+func (w *appWrapper) printStreamSummary() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	fmt.Println("Stream summary:")
+	if len(w.streams) == 0 {
+		fmt.Println("  no active streams were registered")
+	}
+	for reqID, stream := range w.streams {
+		latency := "no tick"
+		if !stream.firstTickAt.IsZero() {
+			latency = stream.firstTickAt.Sub(stream.requestedAt).String()
+		}
+		fmt.Printf(
+			"  reqID=%d %s@%s firstTick=%s updates=%d priceCallbacks=%d sizeCallbacks=%d bid=%s ask=%s last=%s\n",
+			reqID,
+			stream.contract.Symbol,
+			stream.contract.Exchange,
+			latency,
+			stream.updates,
+			stream.priceCallbacks,
+			stream.sizeCallbacks,
+			formatFloat(stream.ticker.bid),
+			formatFloat(stream.ticker.ask),
+			formatFloat(stream.ticker.last),
+		)
+	}
+	if len(w.errors) == 0 {
+		fmt.Println("  errors=none")
+		return
+	}
+	fmt.Println("  errors:")
+	for _, event := range w.errors {
+		fmt.Printf("    %s reqID=%d code=%d %s\n", event.at.UTC().Format(time.RFC3339Nano), event.reqID, event.code, event.message)
+	}
+}
+
+func (w *appWrapper) printTickerLocked(stream *streamSubscription) {
+	if stream == nil {
 		return
 	}
 	ts := time.Now().UTC().Format(time.RFC3339Nano)
 	fmt.Printf("%s %s@%s bid=%s ask=%s last=%s bidSize=%d askSize=%d lastSize=%d\n",
 		ts,
-		w.contract.Symbol,
-		w.contract.Exchange,
-		formatFloat(w.ticker.bid),
-		formatFloat(w.ticker.ask),
-		formatFloat(w.ticker.last),
-		w.ticker.bidSize,
-		w.ticker.askSize,
-		w.ticker.lastSize,
+		stream.contract.Symbol,
+		stream.contract.Exchange,
+		formatFloat(stream.ticker.bid),
+		formatFloat(stream.ticker.ask),
+		formatFloat(stream.ticker.last),
+		stream.ticker.bidSize,
+		stream.ticker.askSize,
+		stream.ticker.lastSize,
 	)
 
 	if w.writer == nil {
@@ -443,14 +610,14 @@ func (w *appWrapper) printTickerLocked() {
 	}
 	_ = w.writer.Write([]string{
 		ts,
-		w.contract.Symbol,
-		w.contract.Exchange,
-		formatFloat(w.ticker.bid),
-		formatFloat(w.ticker.ask),
-		formatFloat(w.ticker.last),
-		fmt.Sprint(w.ticker.bidSize),
-		fmt.Sprint(w.ticker.askSize),
-		fmt.Sprint(w.ticker.lastSize),
+		stream.contract.Symbol,
+		stream.contract.Exchange,
+		formatFloat(stream.ticker.bid),
+		formatFloat(stream.ticker.ask),
+		formatFloat(stream.ticker.last),
+		fmt.Sprint(stream.ticker.bidSize),
+		fmt.Sprint(stream.ticker.askSize),
+		fmt.Sprint(stream.ticker.lastSize),
 	})
 	w.writer.Flush()
 }
